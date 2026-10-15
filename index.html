@@ -1,0 +1,147 @@
+<!doctype html><html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Workflow podcast quotidien — résumé</title>
+<meta property="og:title" content="Workflow podcast quotidien — résumé">
+<meta property="og:description" content="Résumé technique du pipeline de génération du podcast quotidien (15 oct. 2026).">
+<style>body{font-family:system-ui,sans-serif;max-width:860px;margin:2rem auto;padding:0 1rem;line-height:1.5;color:#222}pre{white-space:pre-wrap;background:#f5f5f5;padding:1rem;border-radius:6px;font-size:.92rem}</style>
+</head><body><pre># Résumé du workflow de génération du podcast quotidien
+
+Date de rédaction : 15 octobre 2026. Heures en America/Toronto.
+
+Légende : **[vérifié]** = lu dans le code ou les logs à cette date. **[non vérifié]** = rapporté par un agent ou une note, je ne l&#x27;ai pas confirmé.
+
+---
+
+## 1. Architecture générale
+
+Le flux part de la sélection de sujets et finit par une livraison Telegram.
+
+1. **Collecte et sélection (lun.-ven.)** — [vérifié, d&#x27;après la fiche skill et `cron list`]
+   - Un job 7h20 (`podcast_depuis_bulletin.py`) prend 6-7 nouvelles du bulletin matinal du jour et sert de sélection automatique (règle du 08/10/2026).
+   - Une nouvelle « insolite » sourcée peut s&#x27;ajouter hors liste (règle du 24/09/2026).
+   - Pas de podcast le week-end.
+2. **Génération** — job `0569f382c827` « Podcast — Génération (après sélection) + livraison », à 9h15 en semaine. [vérifié]
+   - Le job lance un agent Hermes qui suit le skill `podcast-quotidien`.
+   - Le script `generate_validated_podcast.py` pilote les étapes.
+3. **Étapes du pipeline** dans `generate_validated_podcast.py` (fonction `main`) [vérifié] :
+   - 0. Contexte du jour : date, météo de Saguenay, agenda et rappels, récupérés du script du bulletin (`build_contexte_jour`).
+   - 1. Résumé court par chapitre (`generate_chapter_summary`), puis script brut avec sections SCRIPT et SOURCES (`generate_script_with_haiku`).
+   - 2. Séparation du texte à lire et des sources (`write_clean_script_for_tts`).
+   - 3. Boucle qualité, jusqu&#x27;à 3 tentatives (une initiale, deux régénérations) :
+     - porte de longueur (plafond seulement) ;
+     - présence de la bonne nouvelle de clôture ;
+     - ouverture personnalisée complète ;
+     - validation par un second modèle ;
+     - traçabilité des sources (ledger).
+   - 4. Fact-checking avec une 2e source (`fact_check_second_source`) sur une affirmation choisie par le modèle.
+   - 5. Synthèse audio via `podcast_tts.py` (ElevenLabs), avec `--no-qc`.
+   - 6. Fichier JSON de l&#x27;épisode (`generate_episode_json`) et état sauvegardé (`pipeline_state.json`).
+   - 7. Copie vers Unraid (`copy_to_unraid`), non bloquante.
+4. **Livraison** — MP3 sur le canal Telegram « Hermes - Podcast » (-1003724661845), via la ligne `MEDIA:` ou `relancer_podcast.sh` (`hermes send`). Jamais dans Bulletins. [vérifié pour le canal ; mécanisme exact de la livraison non vérifié ligne à ligne]
+
+Reprise : sans `--force`, le pipeline reprend à la dernière étape enregistrée le même jour. [vérifié]
+
+---
+
+## 2. Sources de données
+
+- **Sélection** : le bulletin matinal du jour (script `matin_bonjour.py`), et `selection_du_jour.json`. [vérifié]
+- **Recherche web** : le modèle de génération fait une recherche web **par sujet** avant de rédiger (outil `web_search` de Hermes). [vérifié dans le commentaire du code, timeout 900 s]
+- **Registre de sources** : chaque source reçoit un identifiant via `sources.py --ledger &lt;fichier&gt; add &lt;url&gt;` dans `&lt;date&gt;_ledger.json`. Le script vérifie que chaque id cité dans SOURCES existe dans le ledger. [vérifié]
+- **Contexte du jour** : date, météo et agenda à Saguenay, rappels. Ces valeurs viennent du même script que le bulletin ; le modèle ne doit pas les recalculer. [vérifié]
+- **Limites connues** :
+  - Une source « NON SPÉCIFIÉE » ou « Publication inconnue » bloque la vérification du ledger (cas du 14/10). [vérifié dans le cron output]
+  - Les sujets minces raccourcissent l&#x27;épisode (4 min 30 le 15/10 au lieu de ~10 min). [vérifié]
+
+---
+
+## 3. Prompts de génération
+
+Je ne peux pas reproduire ici les prompts en entier : celui du script fait ~105 000 caractères avec le skill embarqué. Voici ce qui est vérifié.
+
+- **Génération du script** (`generate_script_with_haiku`) [vérifié]
+  - Appel : `hermes chat --oneshot --query-file &lt;prompt&gt;`. Le prompt passe par un fichier pour éviter les erreurs de shell.
+  - Pas de modèle ni de provider en dur : le modèle vient de la config Hermes. Dans `config.yaml`, `model.default` = `claude-haiku-5-5` et `model.fallback` = `deepseek/deepseek-v4.1-flash`. [vérifié]
+  - **Température : non réglée dans le code.** Aucune occurrence de `temperature` dans les scripts. [vérifié]
+  - Délai maximal : 900 s.
+  - Le script est réécrit ou non : la vérification compare la date de modification avant et après l&#x27;appel. [vérifié]
+- **Validation par second modèle** (`validate_with_second_model`) [vérifié]
+  - Modèle par défaut : `deepseek/deepseek-chat` via OpenRouter (variable `PODCAST_VALIDATION_MODEL`).
+  - Texte tronqué à 4000 caractères.
+  - Le prompt demande de signaler : marqueurs d&#x27;opinion, citations de source à voix haute, titres de segments, conclusion récapitulative, décimales, balises audio, avalanches de chiffres, citations sans auteur, répétitions internes.
+  - Si l&#x27;appel échoue, la validation est considérée comme réussie (« on continue quand même »). **Point faible.** [vérifié]
+- **Fact-check** (`fact_check_second_source`) : appel `hermes chat --oneshot` avec recherche web, verdict CONFIRMÉ, INFIRMÉ ou similaire. [vérifié, modèle non précisé]
+
+---
+
+## 4. Sélection et filtrage
+
+- **Sélection des sujets** : 6-7 nouvelles du bulletin, plus une insolite sourcée si elle existe. Pas de choix manuel depuis le 08/10/2026. [vérifié, fiche skill]
+- **Sources fiables** : pas X/Twitter, pas Fox News. Règle de la fiche skill, non vérifiée dans le code. [non vérifié]
+- **Doublons** : fichier `covered_topics.json`, mis à jour avec les sujets livrés (pas ajouté après un épisode non livré). [vérifié]
+- **Plafond de longueur** : seul critère dur. Plafond = cible × 1,10 (`CEILING_MARGIN`). Le plancher n&#x27;est plus qu&#x27;un repère affiché. [vérifié]
+- **Sujet trop mince** : retiré du script, le compte des sujets est ajusté. [vérifié]
+- **Règles de rédaction** : 2-3 chiffres marquants par sujet, citations avec auteur, pas d&#x27;opinion ni de jugement de valeur sur l&#x27;importance des faits. Injectées dans le prompt par `charger_consignes_redaction()`. [vérifié]
+
+---
+
+## 5. Traitement du texte avant audio
+
+- **Séparation** : seul le texte « à lire » part en synthèse ; les sources restent pour la vérification. [vérifié]
+- **`nettoyer_artefacts_markdown`** et **`write_clean_script_for_tts`** : suppression des titres markdown et des marqueurs. [vérifié]
+- **`clean()` dans `podcast_tts.py`** : suppression de la première ligne si c&#x27;est un titre, des `#`, des `**`, `__`, et des balises `[[...]]`. [vérifié]
+- **Découpage** : segments de 4500 caractères maximum (limite réelle 10 000). [vérifié]
+- **Garde-fou** : citation de source résiduelle dans le texte à lire = erreur loguée (`tts_*.log`). [vérifié dans les logs du 05/10]
+
+---
+
+## 6. Configuration ElevenLabs
+
+- **Modèle** : `eleven_v4` (défaut). [vérifié]
+- **Format de sortie** : `mp3_44100_128`. [vérifié]
+- **Voix** [vérifié] :
+  - `animatrice` (femme, id `TQ26GKaR2WvP5mP2jzSx`)
+  - `coanimateur` (homme, id `9qnHScllmxqEDCF6Cxs8`)
+  - Rotation quotidienne entre les deux, déterministe sur la date.
+- **Réglages par défaut** [vérifié] : `stability` 0,22 ; `style` 0,00 ; `speed` 1,08 ; similarity non réglé.
+- **Ouverture personnalisée** : un des trois profils V1, V2, V3 tiré au sort chaque jour (stability 0,08 à 0,18 ; style 0,75 à 1,00 ; speed 1,12 à 1,20). Le marqueur `[[SUJETS]]` marque la fin de l&#x27;ouverture. [vérifié]
+- **Intro** : 8 s de musique seule, puis effacement sur 12 s. Outro si le fichier existe. [vérifié]
+- **Contrôle qualité Whisper** : désactivé par défaut (`--no-qc`), décision du 07/10/2026. Le rapport du 15/10 indique 98,1 % mais c&#x27;est l&#x27;agent qui l&#x27;a écrit, je ne l&#x27;ai pas revérifié. [non vérifié]
+- **Coût** : `--dry-run` disponible. Tarif à revérifier selon la note du 06/10. [non vérifié à aujourd&#x27;hui]
+
+---
+
+## 7. Gestion des erreurs et cas limites
+
+- **Étape qui échoue** : le pipeline s&#x27;arrête et l&#x27;exception est loguée (`logs/run_&lt;date&gt;.log`). [vérifié]
+- **Script non réécrit** : détecté par la date de modification, erreur explicite. Cause fréquente : `hermes` absent du PATH sous systemd. Corrigé dans `relancer_podcast.sh` par un PATH explicite. [vérifié]
+- **Validation échouée (appel)** : la validation est ignorée et le pipeline continue. [vérifié]
+- **Régénération** : jusqu&#x27;à deux fois, puis l&#x27;épisode part quand même si le plafond est respecté. [vérifié]
+- **Logs** : `~/.hermes/podcast/logs/` (run, tts, qc) et `~/.hermes/cron/output/0569f382c827/` pour chaque exécution. [vérifié]
+- **Audit de processus** : contrôle des zombies et orphelins en fin de pipeline, non bloquant. [vérifié dans la fiche skill ; présence du code non vérifiée]
+
+---
+
+## 8. Problèmes observés récemment
+
+- **14/10/2026 — épisode non livré.** [vérifié dans la sortie du job]
+  - Cause : une source sans nom a bloqué la porte des sources.
+  - Script trop mince : 322 mots, environ 2 min, pour une cible de 10 min.
+  - Régénérations en échec : validation, traçabilité et ouverture (météo absente).
+  - Aucun MP3. L&#x27;agent n&#x27;a pas relancé.
+- **15/10/2026 — livraison automatique en échec, épisode produit à la main.** [non vérifié, rapporté par l&#x27;agent]
+  - Premier arrêt : une ligne de note (« Sujet 6 retiré ») prise pour une source inconnue. Corrigée à la main.
+  - Non-livraison : `relancer_podcast.sh` s&#x27;arrête en code 1 avant l&#x27;envoi Telegram (substitution `[ ... ] &amp;&amp; echo` sous `set -e`). L&#x27;agent n&#x27;a pas modifié le script.
+  - Durée 4 min 30 au lieu de ~10 min.
+- **Erreur de format `write_file` sur les scripts** (13-15/10) : l&#x27;écriture du script de sortie est refusée quand la tâche n&#x27;a pas relu le fichier. [vérifié dans les logs]
+- **Ancien problème « selon X » dans le texte à lire** (05/10) : désormais détecté par le garde-fou. [vérifié]
+
+---
+
+## Points à valider avant de partager
+
+1. Vérifier le contenu du `relancer_podcast.sh` avant de le corriger (le bug de `set -e` est rapporté, pas confirmé).
+2. Confirmer que la validation DeepSeek « passe en cas d&#x27;échec d&#x27;appel » est le comportement voulu.
+3. Décider si la température doit être fixée (aujourd&#x27;hui elle ne l&#x27;est pas).
+4. Le modèle du fact-check n&#x27;est pas précisé dans le code.
+</pre></body></html>
